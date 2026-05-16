@@ -1,36 +1,36 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
-status: completed
-stopped_at: Completed 08-03-PLAN.md
-last_updated: "2026-05-15T21:10:20.829Z"
-last_activity: 2026-05-15
+milestone: v1.5
+milestone_name: SideStore Distribution
+status: in_progress
+stopped_at: —
+last_updated: "2026-05-16T00:00:00.000Z"
+last_activity: 2026-05-16
 progress:
-  total_phases: 3
-  completed_phases: 3
-  total_plans: 8
-  completed_plans: 8
-  percent: 100
+  total_phases: 0
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-05-14)
+See: .planning/PROJECT.md (updated 2026-05-16)
 
-**Core value:** The phone's thermal state, always visible at a glance — with an alert before it gets dangerously hot.
-**Current focus:** Phase 08 — dashboard-tabs
+**Core value:** The phone's actual health — thermal state, CPU load, and memory pressure — always visible at a glance, with an alert before it gets dangerously hot.
+**Current focus:** Milestone v1.5 — SideStore Distribution
 
 ## Current Position
 
-Phase: 08
-Plan: Not started
-Status: v1.2 milestone complete
-Last activity: 2026-05-15
+Phase: Not started (defining requirements)
+Plan: —
+Status: Defining requirements
+Last activity: 2026-05-16 — Milestone v1.5 started
 
-Progress: [██████████] 100%
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 

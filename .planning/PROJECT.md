@@ -8,9 +8,18 @@ CoreWatch is a personal iOS app (sideloaded, not App Store) that monitors iPhone
 
 The phone's actual health — thermal state, CPU load, and memory pressure — always visible at a glance, with an alert before it gets dangerously hot.
 
-## Current State: v1.4 Shipped
+## Current Milestone: v1.5 SideStore Distribution
 
-Four milestones shipped. v1.4 completes the CoreWatch identity rename across all files, folders, and project configuration.
+**Goal:** Package CoreWatch as a SideStore source so the app auto-refreshes every 7 days without touching Xcode.
+
+**Target features:**
+- `source.json` — AltStore/SideStore app manifest (bundle ID, version, IPA URL pointing to GitHub Releases)
+- Release workflow — Xcode archive → export IPA → attach to GitHub release → update source.json version
+- Install guide — how to add the source URL to SideStore and do the first install
+
+## Previous State: v1.4 Shipped
+
+Five milestones shipped. v1.4 completes the CoreWatch identity rename across all files, folders, and project configuration.
 
 ## Current State
 
@@ -72,13 +81,13 @@ Phase 7 result: live CPU and memory metrics integrated into a 3-tab dashboard (T
 - **Target device:** iPhone (any model running iOS 18+)
 - **Dev machine:** MacBook Air, Apple M3, 16 GB RAM
 - **Toolchain:** Xcode 26.4.1, Swift 6.3, free Apple Developer account (7-day signing)
-- **Distribution:** Sideloaded directly via Xcode over USB
+- **Distribution:** Sideloaded via Xcode over USB (v1.0–v1.4); SideStore auto-refresh distribution in progress (v1.5)
 - **Data source:** `ProcessInfo.thermalState` (public, 4 levels) — IOKit numeric temp confirmed blocked under free Apple ID
 
 ## Constraints
 
 - **Platform:** iOS only
-- **Signing:** Free Apple ID → 7-day certificate expiry, must re-install weekly
+- **Signing:** Free Apple ID → 7-day certificate expiry; SideStore auto-refreshes so manual weekly reinstall is eliminated
 - **Background execution:** `beginBackgroundTask` buys ~30s; no indefinite background polling without APNs
 
 ## Key Decisions
@@ -102,4 +111,4 @@ Phase 7 result: live CPU and memory metrics integrated into a 3-tab dashboard (T
 This document evolves at phase transitions and milestone boundaries.
 
 ---
-*Last updated: 2026-05-16 — v1.3 design system + identity, v1.4 full CoreWatch rename*
+*Last updated: 2026-05-16 — v1.5 milestone started: SideStore distribution*
