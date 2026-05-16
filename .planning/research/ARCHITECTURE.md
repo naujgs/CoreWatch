@@ -479,3 +479,361 @@ This is a personal single-device tool — scaling in the user-count sense is not
 ---
 *Architecture research for: CoreWatch v1.2 — system metrics integration*
 *Researched: 2026-05-14*
+
+---
+---
+
+# Distribution Architecture: SideStore/AltStore Source (v1.5)
+
+**Researched:** 2026-05-16
+**Confidence:** HIGH (source.json schema, hosting mechanics), MEDIUM (SideStore refresh polling interval — not officially documented)
+
+---
+
+## What This Section Covers
+
+How to package CoreWatch as a SideStore source so a user (the developer, in this case) can install and auto-refresh the app without touching Xcode. The three concrete decisions this section answers:
+
+1. Where does `source.json` live in the repo?
+2. GitHub raw URL or GitHub Pages?
+3. What is the end-to-end data flow from Xcode archive to SideStore update?
+
+---
+
+## System Overview
+
+```
+GitHub repo (CoreWatch)
+  ├── source.json              ← app manifest (root of repo, tracked in git)
+  └── Releases (GitHub)
+        └── CoreWatch-v1.5.ipa ← IPA attached to each GitHub Release tag
+
+SideStore (on device)
+  └── polls source.json URL
+        → reads versions[0].downloadURL → points to GitHub Release IPA
+        → compares version string against installed CFBundleShortVersionString
+        → shows "Update" button when version differs
+        → user taps Update → SideStore downloads IPA, re-signs, installs
+```
+
+---
+
+## Decision 1: Where Does source.json Live?
+
+**Decision: repo root (`/source.json`), tracked in git.**
+
+Rationale:
+
+- The overwhelming community convention for AltStore/SideStore sources is root placement. Browsing the `altstore-source` GitHub topic confirms this is the de facto standard across dozens of public sources.
+- Root placement means the raw URL is the shortest possible: `https://raw.githubusercontent.com/naujgs/CoreWatch/main/source.json`. Easy to share, easy to type into SideStore.
+- Subdirectories like `docs/` or `.github/` add no benefit and require a longer URL. `docs/` is for GitHub Pages deployment (not needed here). `.github/` is for workflow and issue template files — putting app distribution metadata there is semantically wrong.
+- **Do not** use a `docs/` subdirectory unless you specifically want GitHub Pages to serve the file (see Decision 2 for why you do not need that here).
+
+**Repo structure change for v1.5:**
+
+```
+CoreWatch/                         (Xcode project folder — unchanged)
+source.json                        (NEW — root of repo, same level as CLAUDE.md)
+.github/
+  workflows/
+    release.yml                    (NEW — optional automation, see build order)
+```
+
+---
+
+## Decision 2: GitHub Raw URL vs. GitHub Pages
+
+**Decision: raw.githubusercontent.com URL. GitHub Pages is not needed.**
+
+### Raw URL
+
+Format: `https://raw.githubusercontent.com/naujgs/CoreWatch/main/source.json`
+
+- Serves the exact file content as committed to `main`.
+- No setup required — works the moment the file is committed.
+- No rate limiting concern for a personal single-user source. Rate limits only matter for high-traffic public sources serving thousands of users per hour.
+- Content-Type is `text/plain` — SideStore parses the JSON body regardless of Content-Type header, so this does not cause problems.
+- Update latency: SideStore fetches fresh each time it checks (no CDN caching layer between the client and GitHub's raw file server for raw.githubusercontent.com URLs). File reflects the commit within seconds of push.
+
+### GitHub Pages
+
+- Requires enabling Pages in repo settings and either using a `docs/` folder or a `gh-pages` branch.
+- Serves with `Content-Type: application/json` if the file extension is `.json` — but this is not a meaningful advantage for SideStore.
+- Adds a CDN caching layer (GitHub Pages uses Fastly). Cache invalidation after a push can take 1–10 minutes. For a personal source this is a minor nuisance (stale source briefly visible) with no upside.
+- Meaningful only for sources with custom domains that need SSL termination or caching for scale. Neither applies here.
+
+**Conclusion:** Raw URL is simpler, immediate, and zero-config. Use it.
+
+---
+
+## Decision 3: The End-to-End Release Workflow
+
+### Manual Workflow (recommended for v1.5 — no CI/CD needed)
+
+This is a personal sideloaded app. Releases are infrequent. A simple manual process is correct; automation would be over-engineering.
+
+```
+Step 1 — Xcode: Archive the app
+  Product → Archive
+  (Organizer window opens)
+
+Step 2 — Xcode: Export IPA
+  Organizer → Distribute App
+  → "Development" distribution (not App Store, not TestFlight)
+  → Select your device / team
+  → Export → saves CoreWatch.ipa to a local folder
+
+Step 3 — GitHub: Create a Release
+  gh release create v1.5 CoreWatch.ipa \
+    --title "CoreWatch v1.5" \
+    --notes "SideStore distribution support"
+  (or use GitHub web UI: Releases → Draft new release → attach IPA)
+
+  Result: IPA is publicly downloadable at a stable URL:
+  https://github.com/naujgs/CoreWatch/releases/download/v1.5/CoreWatch.ipa
+
+Step 4 — Repo: Update source.json
+  Edit source.json:
+    - Bump "version" to match CFBundleShortVersionString (e.g., "1.5")
+    - Set "downloadURL" to the GitHub Release IPA URL from Step 3
+    - Set "date" to today (YYYY-MM-DD)
+    - Set "size" to IPA file size in bytes (get via: stat -f%z CoreWatch.ipa)
+  Commit and push to main.
+
+Step 5 — SideStore: Picks up update
+  Next time SideStore refreshes its sources, it fetches source.json,
+  sees a new version string, and shows an Update button.
+  User taps Update → SideStore downloads IPA → re-signs → installs.
+```
+
+### Why "Development" Export, Not "Ad Hoc"
+
+Free Apple ID accounts cannot create Ad Hoc provisioning profiles — that requires a paid Developer account ($99/yr). Development export is what free Apple ID sideloading uses. SideStore re-signs the IPA on-device using its own signing mechanism, so the original signing method in the export is irrelevant — what matters is that the IPA is not encrypted (App Store IPAs are encrypted and cannot be re-signed).
+
+### IPA Size for source.json
+
+The `size` field is required and must be the IPA byte count. Get it:
+
+```bash
+stat -f%z CoreWatch.ipa   # macOS
+```
+
+SideStore displays this to the user before download. Wrong values cause user confusion but not a functional failure.
+
+---
+
+## source.json Schema
+
+Minimal valid source.json for CoreWatch. Both AltStore and SideStore consume this format identically (HIGH confidence — confirmed against official AltStore docs and SideStore type definitions).
+
+```json
+{
+  "name": "CoreWatch",
+  "identifier": "com.jgs.CoreWatch.source",
+  "apps": [
+    {
+      "name": "CoreWatch",
+      "bundleIdentifier": "com.jgs.CoreWatch",
+      "developerName": "jgs",
+      "localizedDescription": "iPhone health dashboard — thermal state, CPU, and memory at a glance with overheat alerts.",
+      "iconURL": "https://raw.githubusercontent.com/naujgs/CoreWatch/main/assets/icon.png",
+      "tintColor": "#FF6B35",
+      "versions": [
+        {
+          "version": "1.5",
+          "date": "2026-05-16",
+          "downloadURL": "https://github.com/naujgs/CoreWatch/releases/download/v1.5/CoreWatch.ipa",
+          "size": 0,
+          "localizedDescription": "SideStore distribution. Auto-refresh replaces weekly Xcode reinstall."
+        }
+      ]
+    }
+  ],
+  "news": []
+}
+```
+
+**Critical field notes:**
+
+| Field | Requirement | Notes |
+|-------|-------------|-------|
+| `bundleIdentifier` (app) | Must exactly match `CFBundleIdentifier` in Info.plist | Case-sensitive. Mismatch causes SideStore to treat installed app and source entry as different apps. |
+| `identifier` (source root) | Unique reverse-domain string for the source itself | Different from the app's bundle ID. Used by SideStore to deduplicate sources. |
+| `version` | Must match `CFBundleShortVersionString` | This is the string SideStore compares against the installed version to detect updates. |
+| `downloadURL` | Must be a direct download link, not a redirect | GitHub Release asset URLs are direct. Do not use the HTML release page URL. |
+| `size` | Integer bytes | Required. Use `stat -f%z`. |
+| `date` | `YYYY-MM-DD` | Versions array is ordered newest-first. First entry is what SideStore treats as latest. |
+| `iconURL` | Optional but strongly recommended | Can point to any publicly accessible PNG. A raw GitHub URL to a committed asset works. |
+| `marketplaceID` | Do NOT include | Including this field causes SideStore to interpret the app as a notarized PAL app and reject the IPA. |
+
+**SideStore-specific compatibility note (MEDIUM confidence — from SideStore GitHub issue #735):**
+
+SideStore expects `downloadURL` at the version object level (inside the `versions` array). This is identical to how AltStore's current schema works. The older AltStore v1 schema had `downloadURL` at the app top-level — do not use that format. The schema above is correct for both clients.
+
+---
+
+## How SideStore Detects Updates
+
+**Mechanism:** Version string comparison. SideStore fetches `source.json`, reads `versions[0].version`, compares it against the `CFBundleShortVersionString` of the installed app. If they differ, it shows an Update badge. (HIGH confidence — confirmed by AltStore official docs and the `sidestore-source-types` Version interface definition.)
+
+**What triggers a check:** SideStore checks sources when the user opens the app (on foreground) and periodically in the background via iOS background app refresh. The background interval is at Apple's discretion (BGAppRefreshTask) — typically every few hours. There is no documented fixed polling interval. For a personal source, this is irrelevant: the developer is both publisher and sole user, so a manual "Refresh All" in SideStore is sufficient to trigger an immediate check.
+
+**What SideStore does NOT do:** Watch for GitHub webhook events, compare file ETags, or respond to push notifications from the source host. It is pure pull — it fetches the JSON and checks the version string.
+
+**Caching note (MEDIUM confidence — from SideStore GitHub issue #975 and community reports):** SideStore caches source data locally. If an update is not detected after pushing a new `source.json`, removing and re-adding the source clears the cache and forces a fresh fetch. This is the documented workaround for stale-cache update detection failures.
+
+**Update detection gotcha:** SideStore compares version strings as strings, not as semantic version numbers. `"1.10"` and `"1.9"` compare as strings, not numbers. Use simple monotonically increasing version numbers (e.g., `"1.5"`, `"1.6"`) rather than complex semver strings to avoid unexpected ordering.
+
+---
+
+## Data Flow Diagram
+
+```
+Developer machine                    GitHub                      Device (SideStore)
+─────────────────                    ──────                      ─────────────────
+
+1. Xcode Archive
+   → Product → Archive
+   → Export IPA (Development)
+   → CoreWatch.ipa (local)
+
+2. gh release create v1.5
+   CoreWatch.ipa                →   Release asset created
+                                    URL: /releases/download/
+                                         v1.5/CoreWatch.ipa
+
+3. Edit source.json
+   version: "1.5"
+   downloadURL: (release URL)
+   size: (bytes)
+   git commit + push            →   source.json updated
+                                    raw URL reflects new content
+                                    within seconds of push
+
+                                                            4. SideStore refresh
+                                                               GET raw.githubusercontent.com/
+                                                               naujgs/CoreWatch/main/source.json
+                                                               ← JSON response
+
+                                                            5. Version comparison
+                                                               source version "1.5"
+                                                               vs installed "1.4"
+                                                               → mismatch → Update badge shown
+
+                                                            6. User taps Update
+                                                               GET /releases/download/
+                                                                   v1.5/CoreWatch.ipa
+                                                               ← IPA download
+
+                                                            7. SideStore re-signs IPA
+                                                               using its own certificate
+                                                               → installs over existing app
+                                                               → 7-day signing clock reset
+```
+
+---
+
+## Build Order for v1.5
+
+The ordering constraint is strict: the GitHub Release IPA URL must exist before `source.json` can reference it. `source.json` must be committed before SideStore can detect the update.
+
+```
+1. [GATE] IPA must be built and exported from Xcode before anything else.
+   → Archive via Product → Archive
+   → Export as Development IPA
+   → Note the IPA file size (stat -f%z)
+   → No source.json changes yet — the download URL doesn't exist yet.
+
+2. [GATE] GitHub Release must be created and IPA attached before source.json update.
+   → Create the release tag (e.g., v1.5)
+   → Attach the IPA as a release asset
+   → Confirm the asset download URL is live and accessible
+   → This URL is what source.json will reference.
+
+3. source.json — create or update
+   → If first release: create source.json in repo root with the schema above
+   → If subsequent release: update versions[0] with new version, date, downloadURL, size
+   → Keep older versions in the versions array (prepend new entry at index 0)
+   → Commit and push to main
+
+4. Verify
+   → Open raw URL in browser: confirm JSON is valid and reflects new version
+   → In SideStore: add source (first time) or tap Refresh All
+   → Confirm Update badge appears
+   → Tap Update, confirm install succeeds
+   → Confirm app version in Settings → General → iPhone Storage matches new version
+```
+
+**Why this order is strict:**
+
+- If you commit `source.json` before the GitHub Release exists, SideStore will fetch a `downloadURL` that returns 404. SideStore will cache this failure. Users will see a broken update.
+- If you create the Release before exporting the IPA, you have nothing to attach. The Release can be created as a draft, then published after the IPA is attached.
+
+---
+
+## Anti-Patterns to Avoid
+
+### Anti-Pattern 1: Including marketplaceID in source.json
+
+**What goes wrong:** SideStore interprets any source entry with `marketplaceID` (or `buildVersion` alongside it) as a notarized Apple PAL app. It will reject the IPA with a signing error.
+
+**Prevention:** Never include `marketplaceID` or `buildVersion` in the source.json for a sideloaded Development IPA. AltStudio auto-generates these fields — remove them before use.
+
+### Anti-Pattern 2: Using the GitHub Release HTML Page URL as downloadURL
+
+**What goes wrong:** The HTML release page (`github.com/user/repo/releases/tag/v1.5`) is not an IPA download — it's a web page. SideStore will download HTML and fail to parse it as an IPA.
+
+**Prevention:** Use the release asset download URL format: `https://github.com/naujgs/CoreWatch/releases/download/v1.5/CoreWatch.ipa`. Get this URL from the release asset's "Copy link" in the GitHub web UI or from `gh release view --json assets`.
+
+### Anti-Pattern 3: Committing source.json Before the GitHub Release Exists
+
+**What goes wrong:** SideStore fetches the source, gets the version string, tries to download the IPA, gets a 404. It may cache this failure. The update will appear broken until the cache clears (remove/re-add source).
+
+**Prevention:** Follow the build order strictly: IPA built → Release created and asset attached → source.json updated and pushed.
+
+### Anti-Pattern 4: Putting source.json in .github/ or docs/
+
+**What goes wrong:** `.github/` is semantically for GitHub workflow files, issue templates, and pull request templates — not app distribution metadata. `docs/` triggers GitHub Pages expectations. Neither adds value for a raw URL serving scenario.
+
+**Prevention:** Keep source.json at repo root. The raw URL is shorter and the placement is semantically correct.
+
+### Anti-Pattern 5: Omitting the size Field
+
+**What goes wrong:** `size` is required by the schema. SideStore may display "0 bytes" or reject the entry depending on version. Either causes a confusing UX.
+
+**Prevention:** Always run `stat -f%z CoreWatch.ipa` after exporting and set the integer byte count in source.json.
+
+---
+
+## Component Boundaries: Repo Structure After v1.5
+
+```
+CoreWatch/                         ← Xcode project (unchanged)
+  CoreWatch.xcodeproj/
+  ...Swift source files...
+
+source.json                        ← NEW: app manifest, root of repo
+                                      Updated manually each release
+
+.planning/                         ← GSD planning artifacts (unchanged)
+README.md                          ← Existing (can add source URL here)
+```
+
+No new Swift files, no new Xcode targets, no new build phases. The v1.5 work is entirely outside the Xcode project — it is repo and GitHub infrastructure only.
+
+---
+
+## Sources (v1.5 section)
+
+- [Make a Source — AltStore official docs](https://faq.altstore.io/developers/make-a-source) — authoritative schema reference; HIGH confidence
+- [App Sources — SideStore Docs](https://docs.sidestore.io/docs/advanced/app-sources) — confirms AltStore format compatibility; HIGH confidence
+- [sidestore-source-types Version interface](https://sidestore.io/sidestore-source-types/interfaces/Version.html) — required/optional fields, version comparison semantics; HIGH confidence
+- [SideStore GitHub issue #735](https://github.com/SideStore/SideStore/issues/735) — downloadURL field placement, marketplaceID rejection; MEDIUM confidence (community issue report, corroborated by schema docs)
+- [SideStore GitHub issue #975](https://github.com/SideStore/SideStore/issues/975) — source cache behavior, stale-cache workaround; MEDIUM confidence (community issue report)
+- [SideSource GitHubInput interface](https://sidestore.io/SideSource/interfaces/GitHubInput.html) — GitHubInput schema (not used for manual workflow, documented for awareness); MEDIUM confidence
+- [GitHub raw.githubusercontent.com vs GitHub Pages hosting analysis](https://sidestore.io/SideSource/) — raw URL recommended for non-cached personal sources; MEDIUM confidence
+- GitHub `altstore-source` topic (community convention survey) — root placement is de facto standard; MEDIUM confidence
+
+---
+*Distribution architecture for: CoreWatch v1.5 — SideStore source*
+*Researched: 2026-05-16*

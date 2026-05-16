@@ -1,344 +1,404 @@
-# Pitfalls Research
+# Domain Pitfalls
 
-**Domain:** iOS system metrics — Mach kernel APIs, UIDevice battery, SwiftUI display in a Swift 6.3 @MainActor sideloaded app
-**Researched:** 2026-05-14
-**Milestone:** v1.2 — CPU usage, memory pressure, battery level added to existing CoreWatch dashboard
-**Confidence:** HIGH (Mach API behavior, Swift 6.3 concurrency, UIDevice battery API); MEDIUM (energy impact thresholds — Apple does not publish specific interval guidelines)
+**Domain:** iOS SideStore/AltStore distribution — packaging an existing sideloaded app as a SideStore source with auto-refresh
+**Researched:** 2026-05-16
+**Milestone:** v1.5 — SideStore Distribution
+**Confidence:** HIGH (source.json format, Apple ID limits, IPA signing mechanics, VPN dependency); MEDIUM (GitHub rate-limiting specifics, SideStore vs AltStore field-name differences); LOW (iOS 26.x signing changes — still evolving, target device stays on iOS 18)
 
-> This file replaces v1.1 PITFALLS.md for the v1.2 milestone. v1.2 adds Mach kernel API calls for
-> CPU/memory, UIDevice battery monitoring, and SwiftUI display of rapidly-updating scalar values to an
-> existing Swift 6.3 @MainActor @Observable ViewModel. Pitfalls focus exclusively on these new
-> surfaces — v1.0/v1.1 pitfalls (icon, TrollStore, timer RunLoop) are not repeated.
+> This file covers pitfalls specific to the v1.5 milestone: packaging CoreWatch as a SideStore source,
+> producing the IPA, hosting it on GitHub Releases, and relying on SideStore's auto-refresh to eliminate
+> the weekly Xcode reinstall. The target device runs iOS 18; the dev account is a free Apple ID.
+> v1.0–v1.4 pitfalls (Mach APIs, Swift 6 concurrency, icon requirements) are not repeated here.
 
 ---
 
 ## Critical Pitfalls
 
-### Pitfall 1: Zero-Initialized `previousLoad` Produces a Since-Boot Delta on First Sample
+### Pitfall 1: Signing the IPA Before SideStore Receives It Breaks Re-Signing
 
 **What goes wrong:**
-`host_cpu_load_info` returns cumulative tick counts since device boot — not per-interval activity. To compute a meaningful CPU %, you must subtract the previous sample from the current sample. If `previousLoad` is stored as `host_cpu_load_info_data_t()` (zero-initialized struct), the first "delta" is actually the total ticks since boot. On a device that has been running for hours, this produces a first reading of 5–40% CPU when the device is idle — wrong and misleading. It does not crash. It silently displays incorrect data on the very first screen the user sees.
+SideStore re-signs every IPA with the user's own personal development certificate at install and refresh time. If the IPA you distribute is already signed — specifically with an active Development or Ad Hoc certificate — SideStore strips the existing signature and applies its own. This usually works, but shipping a pre-signed IPA creates two specific failure modes:
+
+1. **Entitlement escalation:** If the IPA was exported with entitlements that cannot be granted to a free Apple ID (e.g., `com.apple.developer.sustained-execution`, push entitlements, or any `com.apple.*` private entitlement), SideStore's re-signing will produce an IPA that iOS rejects with "invalid entitlements." The original Xcode-signed build would have worked because Xcode validates and strips entitlements automatically, but the re-signed copy contains the entitlement declaration without the provisioning profile to back it.
+
+2. **`get-task-allow` conflict:** Development builds set `get-task-allow = true` (enables the Xcode debugger). SideStore must also set this to true to perform re-signing via its local device tunnel. If the source IPA already has `get-task-allow = false` (which Ad Hoc and App Store exports do), SideStore may fail to set it, causing the install to hang or crash after launch.
 
 **Why it happens:**
-Swift struct initialization requires an initial value. Developers write `var previousLoad = host_cpu_load_info_data_t()` because it compiles cleanly. The since-boot corruption is only visible at runtime.
+Developers naturally reach for Xcode's "Archive → Export → Ad Hoc" workflow because that's how they do TestFlight builds. Ad Hoc exports are signed with a Distribution certificate and have `get-task-allow = false` — exactly the opposite of what SideStore needs.
 
-**How to avoid:**
-Store `previousLoad` as an `Optional` initialized to `nil`. Return `nil` (display as "—") on the first call:
+**Prevention:**
+Distribute an **unsigned IPA** or a **fake-signed IPA** (also called a zero-signed IPA). Xcode does not expose an "unsigned" export directly in the Organizer, but the following terminal workflow produces one:
 
-```swift
-private var previousLoad: host_cpu_load_info_data_t?
+```bash
+xcodebuild archive \
+  -scheme CoreWatch \
+  -configuration Release \
+  -archivePath /tmp/CoreWatch.xcarchive \
+  CODE_SIGN_IDENTITY="" \
+  CODE_SIGNING_REQUIRED=NO \
+  CODE_SIGNING_ALLOWED=NO
 
-func fetchCPUPercent() -> Double? {
-    // ... call host_statistics, get current load ...
-    guard let prev = previousLoad else {
-        previousLoad = load   // first call — store, don't report
-        return nil
-    }
-    previousLoad = load
-    // compute delta from prev
-}
+# Package as IPA manually
+cd /tmp/CoreWatch.xcarchive/Products
+mv Applications Payload
+zip -r CoreWatch.zip Payload
+mv CoreWatch.zip CoreWatch.ipa
 ```
 
-**Warning signs:**
-- First CPU reading is suspiciously high (10–60%) then drops sharply on the second tick
-- `previousLoad` declared as `host_cpu_load_info_data_t()` (zero struct, not Optional)
-- The problem disappears after the app has run for 10 seconds — making it easy to miss in short test sessions
+Alternatively: Xcode Archive → Organizer → "Distribute App" → "Custom" → "Release Testing" → "Locally" → disable signing → Export. This is the GUI equivalent.
 
-**Phase to address:**
-Research / proof-of-concept. This is the first thing to get right before writing any UI code.
+CoreWatch uses only standard sandbox entitlements (no private APIs, no push, no App Groups, no Keychain groups) — so the entitlement conflict risk is low but confirming an unsigned export is still the safest baseline.
+
+**Detection:**
+- SideStore install succeeds but app crashes immediately on first launch after re-signing
+- Xcode device console shows "The executable was signed with invalid entitlements"
+- Re-signing with a paid certificate on a separate device works; free Apple ID does not
 
 ---
 
-### Pitfall 2: CPU Percentage Formula Includes Idle in the Numerator
+### Pitfall 2: source.json Field-Name Mismatch Between AltStore and SideStore Formats
 
 **What goes wrong:**
-The correct CPU-in-use percentage formula is:
+SideStore and AltStore share a common JSON schema ancestry but have diverged on field names and parsing behavior. The three most dangerous mismatches:
+
+**a) `downloadURL` vs. `versions` array only**
+AltStore allows a `versions` array on each app where each version object contains its own `downloadURL`, and AltStore falls back to `apps[0].versions[0].downloadURL` if no top-level `downloadURL` is present. Older SideStore versions (pre-nightly as of February 2025) require a top-level `downloadURL` key on the app object. Without it, SideStore throws:
 
 ```
-active = user + sys + nice
-total  = user + sys + nice + idle
-pct    = active / total * 100
+E downloadURL:String or downloadURLs:[[Platform:URL]] key required
 ```
 
-A common mistake is including `idle` in both numerator and denominator, producing a number that is always near 100%. Another mistake is using only `user` in the numerator and omitting `sys`, undercounting by 10–30% under load. A third mistake is dividing `active` by total-ticks-since-boot rather than delta-ticks-over-the-polling-interval — producing a slow-moving rolling average that never reflects current load.
+And worse: after this failure, SideStore may corrupt its CoreData store, blocking **all** source updates until the malformed source is removed and SideStore is restarted.
 
-**Why it happens:**
-Online examples vary. Some show per-core percentages (divide by core count), some show system-wide (no division). Some include `nice` in the denominator only. Copy-paste without understanding propagates the error.
+**b) `permissions` vs. `appPermissions` field name**
+AltStore calls the entitlements+privacy array `appPermissions`. SideStore's community source uses `permissions`. Using the wrong key causes the field to be silently ignored — no error, just no permissions declared. If the source declares no permissions and the downloaded IPA contains privacy usage descriptions (e.g., `NSBluetoothAlwaysUsageDescription`), SideStore's permission mismatch check may refuse the install.
 
-**The correct delta formula in Swift:**
-```swift
-let userDiff = Double(load.cpu_ticks.0 &- prev.cpu_ticks.0)   // CPU_STATE_USER
-let sysDiff  = Double(load.cpu_ticks.1 &- prev.cpu_ticks.1)   // CPU_STATE_SYSTEM
-let idleDiff = Double(load.cpu_ticks.2 &- prev.cpu_ticks.2)   // CPU_STATE_IDLE
-let niceDiff = Double(load.cpu_ticks.3 &- prev.cpu_ticks.3)   // CPU_STATE_NICE
+**c) `buildVersion` required in `versions` array**
+AltStore 2.x requires `buildVersion` (maps to `CFBundleVersion`, the integer build number) in every version object. SideStore may ignore it if absent, but for cross-compatibility, always include both `version` (the marketing version string, e.g., "1.5.0") and `buildVersion` (the build number, e.g., "15").
 
-let total = userDiff + sysDiff + idleDiff + niceDiff
-guard total > 0 else { return 0 }
-return (userDiff + sysDiff + niceDiff) / total * 100.0
-```
+**Prevention:**
+Use this minimal safe template that satisfies both AltStore and SideStore:
 
-Use Swift's wrapping subtraction operator `&-` on `natural_t` (UInt32) before casting to Double. This correctly handles the theoretical UInt32 wraparound (occurs after ~497 days at 100 ticks/sec — unlikely but defensively correct).
-
-Note: `host_cpu_load_info` tick counts are aggregate across ALL cores. The result is already normalized to 0–100% of total device capacity. Do not multiply or divide by core count.
-
-**Warning signs:**
-- CPU displays 95–100% when device is clearly idle
-- CPU displays 1–5% during an intensive workload (omitting sys or nice)
-- CPU does not respond to a sudden workload spike for 30+ seconds (using cumulative ticks not deltas)
-
-**Phase to address:**
-Research. Validate the formula on physical device against Xcode's CPU Gauge before integrating into the ViewModel.
-
----
-
-### Pitfall 3: Non-Sendable C Struct Triggers Swift 6.3 Concurrency Compiler Errors — Wrong Fix Is to Use a Background Task
-
-**What goes wrong:**
-`host_cpu_load_info_data_t` and `vm_statistics64_data_t` are C structs imported into Swift. They are not `Sendable`. When a `@MainActor`-isolated function uses `withUnsafeMutablePointer` to pass a pointer to one of these structs to a C function, the compiler may emit:
-
-```
-Capture of 'load' with non-sendable type 'host_cpu_load_info_data_t' in a @Sendable closure
-```
-
-The instinctive "fix" is to move the Mach call off the main actor into a background `Task`. This is wrong for two reasons: (1) Mach calls complete in under 100 microseconds — they do not need to be async, (2) moving the call off `@MainActor` makes the type-crossing problem worse because the C struct result must now cross actor boundaries to get back to the ViewModel, which requires it to be `Sendable`.
-
-**Why it happens:**
-Swift 6 strict concurrency aggressively flags C struct captures in closures. The natural instinct is "make it async / background," which is the correct fix for I/O-bound work but the wrong fix for in-process C calls.
-
-**How to avoid:**
-Keep all Mach calls synchronous and on `@MainActor`. The struct is created, used, and discarded within one function call — the compiler error is a false alarm caused by the closure capture analysis. Annotate the closure explicitly with `@MainActor` to confirm isolation:
-
-```swift
-@MainActor
-private func fetchCPULoad() -> host_cpu_load_info_data_t? {
-    var load = host_cpu_load_info_data_t()
-    var size = mach_msg_type_number_t(
-        MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size
-    )
-    let kr = withUnsafeMutablePointer(to: &load) { ptr in
-        ptr.withMemoryRebound(to: integer_t.self, capacity: Int(size)) { intPtr in
-            host_statistics(machHost, HOST_CPU_LOAD_INFO, intPtr, &size)
+```json
+{
+  "name": "CoreWatch",
+  "identifier": "io.github.naujgs.corewatch",
+  "apps": [
+    {
+      "name": "CoreWatch",
+      "bundleIdentifier": "com.yourname.corewatch",
+      "developerName": "Your Name",
+      "version": "1.5.0",
+      "buildVersion": "15",
+      "versionDate": "2026-05-16T00:00:00Z",
+      "downloadURL": "https://github.com/naujgs/CoreWatch/releases/download/v1.5.0/CoreWatch.ipa",
+      "localizedDescription": "iPhone health monitor: thermal state, CPU, and memory.",
+      "iconURL": "https://raw.githubusercontent.com/naujgs/CoreWatch/main/icon.png",
+      "size": 2621440,
+      "permissions": [],
+      "versions": [
+        {
+          "version": "1.5.0",
+          "buildVersion": "15",
+          "date": "2026-05-16T00:00:00Z",
+          "downloadURL": "https://github.com/naujgs/CoreWatch/releases/download/v1.5.0/CoreWatch.ipa",
+          "localizedDescription": "SideStore distribution release.",
+          "size": 2621440
         }
+      ]
     }
-    return kr == KERN_SUCCESS ? load : nil
+  ],
+  "news": []
 }
 ```
 
-For stored intermediate state (`previousLoad: host_cpu_load_info_data_t?`), mark the property `@ObservationIgnored` to prevent the `@Observable` macro from generating tracking accessors for a non-Sendable C struct.
+Always place `downloadURL` at **both** the top-level app object and inside each `versions` entry. The redundancy is intentional cross-compatibility insurance.
 
-**Warning signs:**
-- `Task { }` wrapping a Mach call — unnecessary and creates new actor-crossing problems
-- `nonisolated(unsafe)` on `previousLoad` — wrong annotation; this property is on MainActor and should be `@ObservationIgnored`
-- Second round of compiler errors after "fixing" the first error by adding a Task
-
-**Phase to address:**
-Research phase. All compiler warnings must be zero before wiring metrics into the ViewModel.
+**Detection:**
+- Source loads in SideStore but no apps appear in the list (field-name mismatch parsing failure)
+- "CoreData error" appears when refreshing sources (malformed source corrupted the store)
+- App appears but shows "Permissions mismatch — cannot install" at install time
 
 ---
 
-### Pitfall 4: `host_statistics` Count Argument Calculated from Raw `sizeof` — Struct-Integer Mismatch Causes KERN_INVALID_ARGUMENT
+### Pitfall 3: `bundleIdentifier` in source.json Must Match Info.plist Exactly (Case-Sensitive)
 
 **What goes wrong:**
-`host_statistics` and `host_statistics64` take a `mach_msg_type_number_t` count argument representing the number of `integer_t`-sized units in the info struct. Developers often pass `MemoryLayout<host_cpu_load_info_data_t>.size` directly. This is wrong — it passes the byte count, not the integer_t count. The call returns `KERN_INVALID_ARGUMENT` (error code 4) and the struct is left in an undefined state. The `KERN_SUCCESS` guard then catches this, but the real bug is the wrong count formula.
+The `bundleIdentifier` field in source.json is matched against `CFBundleIdentifier` in the IPA's Info.plist by SideStore at install time. Any mismatch — including capitalization differences — causes SideStore to refuse the install with a generic "app is invalid" error. This also interacts with Apple's App ID registration: the bundle ID registered with your Apple account (when SideStore provisions the app) must match what's in the binary.
 
-**Why it happens:**
-In C, the idiom `HOST_CPU_LOAD_INFO_COUNT` is a macro defined as `sizeof(host_cpu_load_info_data_t) / sizeof(integer_t)`. Swift developers reproduce this as `MemoryLayout<host_cpu_load_info_data_t>.size` without the division, which is half the idiom.
+The CoreWatch project has been through a rename (`Termostato` → `CoreWatch`). Confirm the bundle ID is consistent across:
+- Xcode project → Signing & Capabilities → Bundle Identifier
+- Info.plist `CFBundleIdentifier` (should be `$(PRODUCT_BUNDLE_IDENTIFIER)`)
+- source.json `bundleIdentifier`
+- Any previous App ID registrations on your Apple account
 
-**How to avoid:**
-Always divide by `MemoryLayout<integer_t>.size`:
+**Secondary issue — App ID already registered (Error 3011):**
+When SideStore tries to provision an app, it calls Apple's API to register the bundle ID. If that bundle ID was previously registered by an earlier install (Xcode direct or prior SideStore install) and the 7-day window has not expired, Apple returns "bundle identifier already registered." SideStore may show this as Error 3011 or a generic provisioning failure. The fix is to wait for the prior App ID to expire (up to 7 days from the original install date) or install via Xcode once to force re-provision with the same bundle ID.
 
-```swift
-var size = mach_msg_type_number_t(
-    MemoryLayout<host_cpu_load_info_data_t>.size / MemoryLayout<integer_t>.size
-)
-```
+**Prevention:**
+- Build and install the app via Xcode once with the final bundle ID before creating the SideStore source
+- Do not change the bundle ID after the source is created and the app is installed on the device
+- Run `grep -r "CFBundleIdentifier" CoreWatch/` and verify the single value matches source.json
 
-For `vm_statistics64_data_t`:
-```swift
-var size = mach_msg_type_number_t(
-    MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size
-)
-```
-
-**Warning signs:**
-- `host_statistics` returns a non-zero value (not KERN_SUCCESS)
-- CPU or memory reading is always nil after adding the KERN_SUCCESS guard
-- Adding a print on kr reveals `4` (KERN_INVALID_ARGUMENT)
-
-**Phase to address:**
-Research / proof-of-concept. Add a `precondition(kr == KERN_SUCCESS)` during development to catch this immediately rather than silently returning nil.
+**Detection:**
+- SideStore Error 3011: "The bundle identifier for this app has already been registered"
+- Install fails immediately with "app is invalid" even though the IPA installs cleanly via Xcode
 
 ---
 
-### Pitfall 5: `vm_statistics64` `free_count` Alone Understates Available Memory by 20–50%
+### Pitfall 4: Free Apple ID App Slot Limit Collides With SideStore Itself Occupying One Slot
 
 **What goes wrong:**
-`host_statistics64` with `HOST_VM_INFO64` returns a `vm_statistics64_data_t`. Using `free_count` alone as "available memory" produces a figure 20–50% lower than what Instruments / Xcode Memory Report shows. The missing component is `speculative_count` — pages that have been read ahead by the kernel and not yet dirtied. These pages are immediately reclaimable and functionally equivalent to free memory from the app's perspective. Reporting only `free_count` makes the device appear more memory-constrained than it is.
+Apple enforces a **3-app simultaneous install limit** and a **10 App ID registrations per 7-day rolling window** for free Apple IDs. SideStore itself (plus the StosVPN/WireGuard app required for its VPN tunnel) already consumes 1–2 of the 3 slots. CoreWatch as a SideStore-managed app takes another slot. This leaves 0–1 slots for anything else.
 
-**How to avoid:**
-Use the Activity Monitor formula:
-```swift
-let pageSize = UInt64(vm_kernel_page_size)   // 16384 on modern iPhones; do NOT use 4096
-let freeBytes = UInt64(stats.free_count + stats.speculative_count) * pageSize
-let totalBytes = ProcessInfo.processInfo.physicalMemory
-let usedBytes = totalBytes > freeBytes ? totalBytes - freeBytes : 0
+The practical collision for this project: if the device already has SideStore + WireGuard + one other app installed under the same Apple ID, adding CoreWatch via SideStore will fail with:
+
 ```
+Error 1009: You cannot register more than 10 App IDs within a 7-day period
+```
+or a generic "maximum apps installed" failure.
 
-Always multiply page counts by `vm_kernel_page_size` (not 1024, not 4096). On iPhones with A9+ the page size is 16384 bytes. Using 4096 produces numbers 4× too small.
+**The 10-App-ID-per-week limit is a harder wall:** Each SideStore install or refresh of an app consumes one App ID registration for 7 days. Over a month of weekly refreshes, 4 App ID slots are consumed just for CoreWatch. If the same Apple ID is used with other sideloading tools simultaneously (Xcode direct install, other AltStore/SideStore apps), the pool drains faster.
 
-**Warning signs:**
-- Displayed "free memory" is consistently 30–50% lower than Xcode's Memory Report gauge
-- Raw page count displayed without multiplication by page size (numbers like "24,576 free")
-- `vm_kernel_page_size` not used — `4096` or `1024` hardcoded instead
+The **SparseRestore bypass** for the 3-app limit was patched in iOS 18.1 beta 5 and does not work on iOS 18.x stable. There is no known bypass for the 10 App ID per week limit.
 
-**Phase to address:**
-Research. Validate displayed figure against Xcode Memory Report on physical device before shipping.
+**Prevention:**
+- Use a **dedicated Apple ID exclusively for SideStore** — no Xcode installs with the same ID
+- Keep the total number of SideStore-managed apps to 2 (SideStore + CoreWatch) to avoid hitting the 3-slot wall
+- Monitor App ID usage in SideStore: My Apps tab → "View App IDs"
+- If the 7-day limit is hit, wait — App IDs expire on a rolling basis and slots re-open automatically
+
+**Detection:**
+- Error 1009 on install or refresh
+- SideStore shows "0 App IDs Remaining" (known SideStore bug that misreports free account status)
+- Install fails immediately after the 7th or 8th app in a given week
+
+---
+
+### Pitfall 5: SideStore Refresh Requires the VPN to Be Active — Auto-Refresh Silently Fails Without It
+
+**What goes wrong:**
+SideStore's core mechanism involves intercepting iOS's local device communication via a loopback VPN (WireGuard or the newer StosVPN/LocalDevVPN). The VPN **must be active** whenever SideStore performs any install or refresh operation. On iOS 18, the VPN profile must be accepted by the user and active in Settings → VPN.
+
+The failure mode is silent: if SideStore background-refreshes and the VPN is off (e.g., user manually disabled it, iOS killed the VPN profile, or the WireGuard config expired), the refresh fails silently. The app's certificate timer keeps counting down. On day 7 the app stops launching with "app is no longer available" — the user thinks SideStore auto-refresh worked but the app expired anyway.
+
+**SideStore 0.6.x ships StosVPN** as a replacement for WireGuard. StosVPN is SideStore-specific and works on both Wi-Fi and cellular, whereas WireGuard-based LocalDevVPN only works on Wi-Fi. If still using WireGuard, cellular connections will silently prevent refresh.
+
+**Prevention:**
+- Use StosVPN (the current default in SideStore 0.6.x), not WireGuard/LocalDevVPN
+- Verify the SideStore VPN is active after every iOS update — iOS updates sometimes clear VPN profiles
+- After initial SideStore install, confirm at least one successful manual refresh before relying on background auto-refresh
+- Do not install the app on the device and immediately switch to cellular — the first post-install refresh must happen on Wi-Fi with VPN active
+
+**Detection:**
+- App shows "not on WLAN and/or VPN" error in SideStore (Error 1414)
+- App launches with a countdown timer saying "X days remaining" and the count approaches zero without SideStore showing a successful refresh
+- SideStore shows the last refresh date as older than 7 days despite device staying connected
 
 ---
 
 ## Moderate Pitfalls
 
-### Pitfall 6: `UIDevice.isBatteryMonitoringEnabled` Left `true` After App Backgrounds
+### Pitfall 6: GitHub Releases `downloadURL` — Use Direct Asset Links, Not `api.github.com` Redirects
 
 **What goes wrong:**
-`isBatteryMonitoringEnabled = true` activates a system-level monitoring process. Leaving it permanently enabled — even when the app is backgrounded and battery metrics are not being displayed — runs that process during periods when the app produces no value from the data. This is a minor but real energy cost and signals a lifecycle mismatch.
+GitHub Releases assets are accessible via two URL patterns:
 
-**How to avoid:**
-Mirror the existing `startPolling()` / `stopPolling()` pattern in the ViewModel:
+1. **Direct:** `https://github.com/user/repo/releases/download/v1.5.0/CoreWatch.ipa`
+2. **API redirect:** `https://api.github.com/repos/user/repo/releases/assets/12345`
 
-```swift
-// In startPolling():
-UIDevice.current.isBatteryMonitoringEnabled = true
+SideStore follows HTTP redirects but GitHub's API endpoints apply rate limits (60 requests/hour for unauthenticated requests). GitHub also changed raw download rate-limiting behavior in December 2024, and additional changes occurred in 2025. The `api.github.com` pattern can return HTTP 429 (rate limit) or 302 redirect chains that SideStore's HTTP client handles inconsistently.
 
-// In stopPolling():
-UIDevice.current.isBatteryMonitoringEnabled = false
+The direct releases download URL (`github.com/releases/download/...`) is CDN-backed and not subject to the API rate limit. Always use this form.
+
+**Additional constraint:** GitHub does not allow files >2 GB in Releases, but CoreWatch IPAs will be well under 50 MB, so this is not a practical limit here.
+
+**Prevention:**
+- Format `downloadURL` as `https://github.com/USER/REPO/releases/download/TAG/FILENAME.ipa`
+- Never use `api.github.com` URLs in source.json
+- After uploading a release asset, copy the URL from the GitHub Releases page download link — this is always the direct CDN-backed URL
+- Test the download URL directly in Safari on the device before publishing the source
+
+**Detection:**
+- SideStore shows a download progress bar that stalls at 0% or errors after starting
+- `curl -I "YOUR_DOWNLOAD_URL"` returns a 302 chain ending at `api.github.com`
+
+---
+
+### Pitfall 7: `size` Field Must Match the Actual IPA File Size in Bytes
+
+**What goes wrong:**
+The `size` field in source.json must be the precise byte count of the IPA file. SideStore verifies the downloaded file size against this value. A mismatch causes the install to fail with a vague "The download failed" or "Invalid app" error. Common mistakes:
+
+- Copying the size from a previous release without updating it for the new build
+- Using kilobytes or megabytes instead of bytes (`2621440` bytes, not `2560` KB)
+- Getting the size before the IPA is fully compressed (e.g., measuring the `.xcarchive` size instead of the `.ipa`)
+
+**Prevention:**
+Always measure the final IPA file size immediately before publishing:
+
+```bash
+stat -f%z CoreWatch.ipa     # macOS: prints byte count
+# or
+ls -l CoreWatch.ipa         # byte count in the 5th column
 ```
 
-Register `UIDeviceBatteryLevelDidChange` and `UIDeviceBatteryStateDidChange` observers in `startPolling()` and remove them in `stopPolling()`. Do not rely on `deinit` alone — the ViewModel stays alive in memory while the app is backgrounded.
+Update source.json `size` field with this exact value before committing and before uploading to GitHub Releases.
 
-**Warning signs:**
-- `isBatteryMonitoringEnabled = true` in `init()` with no matching `false`
-- Battery notification observers added without paired `removeObserver` calls
-- `UIDevice.current.batteryLevel` returns `-1.0` — monitoring was not enabled before reading
-
-**Phase to address:**
-Implementation — lifecycle pairing is required before merging the battery feature.
+**Detection:**
+- Download completes but install fails with no meaningful error message
+- `ls -l CoreWatch.ipa` vs. source.json `size` field shows a mismatch
 
 ---
 
-### Pitfall 7: `UIDeviceBatteryLevelDidChange` Fires Infrequently — Do Not Rely on It for Live Display
+### Pitfall 8: `version` and `buildVersion` in source.json Must Match Info.plist Exactly
 
 **What goes wrong:**
-Developers register for `UIDeviceBatteryLevelDidChange` expecting it to fire on every 1% battery change. It does not. iOS fires this notification at system-determined intervals (documentation says "when battery level changes" but in practice the threshold is multiple percentage points or significant time). Building the battery level display to update only on this notification results in a label that appears frozen between updates.
+SideStore matches `version` against `CFBundleShortVersionString` and `buildVersion` against `CFBundleVersion` from the downloaded IPA's Info.plist. A mismatch causes SideStore to report an "incorrect version" error and abort the install. This commonly happens when:
 
-**How to avoid:**
-Poll `UIDevice.current.batteryLevel` on the existing 10-second timer tick (same as the thermal state poll). Use `UIDeviceBatteryStateDidChange` only for charging state changes (plugged in / unplugged), which fire reliably. Display format: multiply by 100, round to Int, show as "73%". Guard for `-1.0` (monitoring not enabled or simulator) — display "—".
+- The source.json is updated but Xcode project version numbers are not incremented (or vice versa)
+- The developer formats the version differently: source.json says `"1.5"` but Info.plist says `"1.5.0"`
+- Build number is left at the default `1` in Xcode while source.json says `15`
 
-**Warning signs:**
-- Battery level label not updating despite obvious battery drain
-- `UIDeviceBatteryLevelDidChange` handler contains the only battery level read in the codebase
+**Prevention:**
+After archiving, extract the Info.plist from the IPA and verify both fields before publishing:
 
-**Phase to address:**
-Implementation — wire battery level into the existing polling update function.
-
----
-
-### Pitfall 8: Displaying Raw CPU % in SwiftUI — Visible Jitter From Natural Variance
-
-**What goes wrong:**
-`host_cpu_load_info` at 10-second intervals produces delta percentages that naturally vary 5–15 points between polls even under stable workloads. The label jumps visibly every tick, making the display look broken even when the formula is correct. This is a readability problem, not a correctness problem — but it erodes user trust.
-
-**How to avoid:**
-Apply a 3-sample Exponential Moving Average (EMA) for the display value. Keep the raw value for diagnostics:
-
-```swift
-private var cpuEMA: Double = 0.0
-private let cpuAlpha: Double = 0.4   // weight for newest sample
-
-// After computing rawCPU:
-cpuEMA = cpuAlpha * rawCPU + (1.0 - cpuAlpha) * cpuEMA
-// Publish cpuEMA to the UI, not rawCPU
+```bash
+# Extract Info.plist from IPA
+unzip -p CoreWatch.ipa 'Payload/CoreWatch.app/Info.plist' | plutil -convert xml1 - -o - | grep -A1 "CFBundleShortVersionString\|CFBundleVersion"
 ```
 
-Alpha of 0.4 gives a ~3-sample weighted average. Do not use a window larger than 5 samples (50 seconds at 10s polling) — genuine spikes will appear slow to respond.
+The values printed must exactly match source.json `version` and `buildVersion`.
 
-**Warning signs:**
-- CPU label visibly jumping 10+ points between stable-load ticks
-- User reports "the number looks random" on an idle device
-- Instruments Core Animation trace shows view redraws exactly coinciding with timer ticks with large delta values
-
-**Phase to address:**
-Polish — after formula correctness is established and verified. Do not smooth during research; raw values are needed to diagnose the formula.
+**Detection:**
+- SideStore error: "The app version does not match"
+- App shows up as an "update available" for a version that's already installed
 
 ---
 
-### Pitfall 9: Adding Multiple `@Observable` Properties That All Change on One Timer Tick
+### Pitfall 9: Anisette Server Rate-Limiting and Account Lockout From Shared v1 Servers
 
 **What goes wrong:**
-Adding `cpuPercent`, `memoryUsedBytes`, `memoryFreeBytes`, `batteryLevel`, and `batteryState` as individual `@Observable` properties causes SwiftUI to re-evaluate every body that reads any of these properties, separately, on each timer tick. With 5 new observable properties all changing simultaneously, a view reading all five triggers 5 separate diff cycles — not 1.
+SideStore authenticates with Apple using an "Anisette" server that generates one-time machine-authentication tokens. Older v1 Anisette servers are shared among many SideStore users. When many accounts authenticate through the same machine, Apple's security detects the shared hardware fingerprint and flags associated Apple IDs as suspicious, triggering:
 
-**How to avoid:**
-Bundle all system health metrics into a single value type:
+- "Too many requests" from the Anisette server
+- Apple ID soft-lock requiring a phone-number verification to unlock
+- Authentication failure with no clear error message
 
-```swift
-struct SystemMetrics {
-    var cpuPercent: Double?
-    var memoryUsedMB: Int
-    var memoryFreeMB: Int
-    var batteryPercent: Int?   // nil when monitoring not enabled
-    var batteryState: UIDevice.BatteryState
-}
+This does not directly affect app distribution (source.json hosting), but it blocks the initial SideStore login and any refresh operation that needs re-authentication.
 
-// In ViewModel:
-private(set) var metrics = SystemMetrics(...)
+**Prevention:**
+- Use SideStore 0.4.0 or later (adds v3 Anisette server support, which dramatically reduces account lockout risk)
+- Switch to one of the SideStore team's official v3 Anisette servers (listed in Settings → SideStore → Anisette URL) — do not stay on the default if it's a v1 server
+- Use a **dedicated throwaway Apple ID** for SideStore, not the primary Apple ID associated with purchases, iCloud data, or other apps
+- Do not use the same Apple ID simultaneously with other sideloading tools (Sideloadly, AltServer) — concurrent authentication from multiple machines is a strong lockout signal
+
+**Detection:**
+- Login hangs indefinitely or returns "Authentication failed" with no error code
+- Apple sends an "Unusual sign-in activity" email to the Apple ID
+- Switching to a different Anisette URL resolves the issue immediately
+
+---
+
+### Pitfall 10: Certificate Revocation When SideStore Is Used on More Than One Device With the Same Apple ID
+
+**What goes wrong:**
+A free Apple ID can have at most **2 simultaneous iOS Development certificates**. When SideStore installs on a new device and needs to generate a certificate, if 2 already exist, it revokes one. Any SideStore-managed apps signed with the revoked certificate — on any device — stop launching until refreshed with the new certificate.
+
+This is a known recurring bug in SideStore (reported in issues #978 and #1156). In practice: if CoreWatch is installed via SideStore on an iPhone and the same Apple ID is used to install SideStore on a second device, CoreWatch on the first device will stop launching within minutes of the second install.
+
+For CoreWatch's use case (single personal device), this is low risk. It becomes a problem if the same Apple ID is used across an iPhone and an iPad, or shared with another person.
+
+**Prevention:**
+- Limit SideStore to a single device per Apple ID
+- If multiple devices are needed, use separate Apple IDs (each gets its own 2-certificate quota)
+- After any certificate-related incident, manually refresh all affected apps in SideStore before the next launch attempt
+
+**Detection:**
+- App stops launching with "app is no longer available" shortly after a SideStore install on a second device
+- SideStore shows a certificate error with "Unable to use an existing signing certificate"
+- Two different Apple IDs in SideStore (on the same or different devices) referencing overlapping certificates
+
+---
+
+### Pitfall 11: `versions` Array Order Determines Which Version SideStore Treats as "Latest"
+
+**What goes wrong:**
+AltStore and SideStore both use the **first entry** in the `versions` array as the "latest" version. This is not semantic versioning — it is purely positional. If an older version entry is accidentally placed first (e.g., by inserting a new release at the bottom of the array), SideStore will offer a "downgrade" to the old version or, worse, show no update available when one exists.
+
+**Prevention:**
+Always insert new versions at the **top** (index 0) of the `versions` array. The array should read newest-first, oldest-last:
+
+```json
+"versions": [
+  { "version": "1.6.0", ... },   // newest first
+  { "version": "1.5.0", ... },   // previous
+  { "version": "1.4.0", ... }    // older
+]
 ```
 
-SwiftUI diff now runs once per tick on the `metrics` property, not once per sub-property. Mark sub-properties that SwiftUI does not need to observe directly as non-`@Observable` if using the struct bundle pattern.
-
-**Warning signs:**
-- Instruments SwiftUI trace shows multiple body re-evaluations per timer tick for the same view
-- Adding 4+ new scalar properties to the ViewModel without grouping them
-
-**Phase to address:**
-Implementation — decide on the grouping structure before writing any new ViewModel properties.
+**Detection:**
+- After publishing a new IPA, SideStore shows no update available
+- SideStore offers to install an older version labeled as the current version
 
 ---
 
-## Technical Debt Patterns
+## Minor Pitfalls
 
-| Shortcut | Immediate Benefit | Long-term Cost | When Acceptable |
-|----------|-------------------|----------------|-----------------|
-| Displaying raw (unsmoothed) CPU % | Simpler code during research | Label jitter; looks broken at 10s interval | Research/proof-of-concept only — add EMA before Polish is done |
-| Storing `previousLoad` as zero-struct instead of Optional | No nil-check in caller | First sample always corrupted; silent wrong data | Never — one-line fix |
-| Calling `mach_host_self()` inline each poll tick instead of caching | Fewer stored properties | Harmless for host port (it is a special non-destructible port) but establishes a misleading pattern that will be wrong if applied to other ports | Acceptable in minimal personal app; prefer caching for clarity |
-| Leaving `isBatteryMonitoringEnabled = true` permanently | No lifecycle teardown code | Minor energy cost; slight battery monitoring overhead when backgrounded | Acceptable in a personal foreground monitoring tool — document the decision |
-| Individual scalar `@Observable` properties for each metric | Easier to add one at a time | SwiftUI runs multiple diff cycles per tick; adds boilerplate as metrics grow | Acceptable for 1–2 metrics; prefer struct grouping at 3+ |
+### Pitfall 12: source.json MIME Type and Raw Hosting URL
 
----
+**What goes wrong:**
+SideStore fetches source.json via HTTP and expects `Content-Type: application/json`. If the file is hosted on a GitHub repo branch (e.g., `raw.githubusercontent.com`), GitHub serves it with the correct MIME type. However, if hosted on a static site that maps `.json` to `text/plain` or `application/octet-stream`, SideStore may fail to parse it.
 
-## Performance Traps
+GitHub Pages (`github.io`) serves `.json` files with `application/json`. GitHub raw (`raw.githubusercontent.com`) also works. Both are safe choices.
 
-| Trap | Symptoms | Prevention | When It Breaks |
-|------|----------|------------|----------------|
-| Polling at 1–2s interval "for better resolution" | App appears in Xcode Energy report as High impact; CPU reading includes its own polling overhead (self-reinforcing) | Keep 10s for display; if 1s data is needed for research, collect silently without publishing to UI | Immediately — visible in Instruments Energy Log on first test |
-| Rolling CPU + memory + battery all into the session chart at 10s resolution | 360 entries × 3 metrics = 1080 chart points at 1-hour session; Swift Charts redraws all on each tick | Cap chart at 120–180 entries for the new metrics; use same ring buffer pattern as thermal history | Perceptible chart redraw lag after 20–30 minutes of continuous use |
-| `UIDeviceBatteryLevelDidChange` observer doing synchronous heavy work | Battery state changes occasionally but handler runs on unspecified queue; data race in Swift 6 strict mode | Register observer with `queue: .main`; keep handler lightweight | Silent data race — detected by Thread Sanitizer, not crash at runtime |
-| Using `host_statistics` (32-bit) instead of `host_statistics64` for memory | Correct on iOS 17 and earlier; `host_statistics64` is required for accurate stats on 64-bit devices and current iOS | Use `host_statistics64` with `HOST_VM_INFO64` — the 64-bit version has been available since iOS 6 | Silent numeric truncation on large-RAM devices (4GB+ iPhones) |
+**Prevention:**
+Host source.json on GitHub Pages or `raw.githubusercontent.com`. Test with:
+
+```bash
+curl -I "YOUR_SOURCE_JSON_URL"
+# Expect: Content-Type: application/json
+```
 
 ---
 
-## "Looks Done But Isn't" Checklist
+### Pitfall 13: `iconURL` Must Be a Reachable HTTPS URL Returning a Valid PNG/JPEG
 
-- [ ] **CPU % formula:** Verify idle ticks are in the denominator but NOT the numerator. Including idle in the numerator yields 95–100% at idle.
-- [ ] **First-sample guard:** UI shows "—" or "Warming up" for CPU on first display tick. A reading of 20–60% on first render is the zero-struct initialization bug.
-- [ ] **KERN_SUCCESS guard:** Every call to `host_statistics` and `host_statistics64` is guarded. Return value 4 means KERN_INVALID_ARGUMENT — the count formula is wrong.
-- [ ] **`vm_kernel_page_size` multiplication:** Memory bytes = page count × `vm_kernel_page_size` (16384), not × 4096 or × 1024.
-- [ ] **`free_count + speculative_count`:** Available memory uses both fields, not `free_count` alone. Validate within 10% of Xcode Memory Report.
-- [ ] **Battery monitoring lifecycle:** `isBatteryMonitoringEnabled = false` is called in `stopPolling()`. Background the app and verify Console shows no ongoing battery monitoring activity.
-- [ ] **`batteryLevel` guard:** UI displays "—" when `batteryLevel == -1.0` (monitoring not started or Simulator).
-- [ ] **Swift 6 clean build:** Zero non-sendable or actor-isolation warnings in the new metrics code path. `Product > Build` must be clean.
-- [ ] **Energy impact baseline:** Xcode Energy Gauge shows no more than one tier increase (Low → Fair acceptable; Low → High is not) after adding metrics polling to the existing 10s timer.
-- [ ] **EMA alpha tuning on device:** Under an artificial load spike, the smoothed CPU % responds visibly within 2 poll ticks (20 seconds). If it takes longer, alpha is too low.
+**What goes wrong:**
+SideStore fetches the icon at source load time. If the URL returns a 404, requires authentication, or returns an SVG, SideStore may show a broken image or fail to load the source at all. GitHub raw image URLs are reliable as long as the commit or branch they reference exists.
+
+**Prevention:**
+Use a `raw.githubusercontent.com` URL pointing to the `main` branch. Avoid commit-hash-pinned URLs for icons (the hash reference may become orphaned after force pushes or branch cleanups).
+
+---
+
+### Pitfall 14: Xcode Development Terms of Service Block SideStore Login (Error 1102 / -1011)
+
+**What goes wrong:**
+If the Apple ID used for SideStore has never accepted Apple's Developer Terms of Service, SideStore will fail to generate the provisioning profile needed for re-signing. This appears as Error 1102 ("Apple ID cannot be used for development") or Error -1011 ("Developer Terms Not Accepted").
+
+A dedicated throwaway Apple ID created specifically for SideStore will trigger this on first use — the TOS must be accepted at `developer.apple.com` using a browser before SideStore can use the account for signing.
+
+**Prevention:**
+After creating the dedicated Apple ID: log in at `developer.apple.com`, click "Agree" on the free membership TOS, then use the account in SideStore.
+
+---
+
+## Phase-Specific Warnings
+
+| Phase Topic | Likely Pitfall | Mitigation |
+|-------------|---------------|------------|
+| Exporting IPA from Xcode | Signed IPA breaks SideStore re-signing (Pitfall 1) | Use unsigned export via `xcodebuild CODE_SIGNING_REQUIRED=NO` |
+| Authoring source.json | `downloadURL` missing at top-level breaks SideStore (Pitfall 2) | Use template with redundant `downloadURL` at both levels |
+| `bundleIdentifier` in source.json | Case mismatch causes silent install failure (Pitfall 3) | Extract from Info.plist with `plutil`, copy exactly |
+| `size` field | Wrong byte count causes download verification failure (Pitfall 7) | Always run `stat -f%z CoreWatch.ipa` after export |
+| `version` / `buildVersion` fields | Mismatch with Info.plist aborts install (Pitfall 8) | Extract from IPA with `unzip -p` before committing source.json |
+| Publishing GitHub Release | Using api.github.com URL instead of direct CDN URL (Pitfall 6) | Copy URL from GitHub Releases page download button only |
+| First device install via SideStore | Apple ID TOS not accepted (Pitfall 14) | Log into developer.apple.com first |
+| First SideStore login | Anisette server lockout (Pitfall 9) | Use v3 Anisette server, dedicated Apple ID |
+| App slot planning | 3-slot limit blocks install if Apple ID has other apps (Pitfall 4) | Use dedicated Apple ID for SideStore only |
+| Testing auto-refresh | VPN not active causes silent refresh failure (Pitfall 5) | Verify StosVPN is on; test first manual refresh before trusting background |
+| Updating source.json for v1.6+ | New version entry inserted at wrong array position (Pitfall 11) | Insert newest version at index 0 of `versions` array |
 
 ---
 
@@ -346,55 +406,40 @@ Implementation — decide on the grouping structure before writing any new ViewM
 
 | Pitfall | Recovery Cost | Recovery Steps |
 |---------|---------------|----------------|
-| Zero-struct `previousLoad` producing inflated first sample | LOW | Change type to `host_cpu_load_info_data_t?`, return nil on first call — 3 lines |
-| Background Task wrapping Mach call causes new actor-crossing errors | MEDIUM | Remove Task wrapper; move Mach call back to synchronous `@MainActor` path — 15–30 min |
-| Memory figure 30–50% below Instruments | LOW | Add `speculative_count` to free_count in the available-memory calculation — 1 line |
-| CPU % at 95–100% idle | LOW | Audit formula numerator; remove idle from numerator; verify subtraction uses previous sample not boot-cumulative |
-| `KERN_INVALID_ARGUMENT` from host_statistics | LOW | Fix count formula: add `/ MemoryLayout<integer_t>.size` to the size calculation |
-| Battery monitoring leaving energy footprint in background | LOW | Add `UIDevice.current.isBatteryMonitoringEnabled = false` to `stopPolling()` — 1 line |
-| UI thrashing / visible CPU label jitter | MEDIUM | Add EMA smoothing to display value; separate display cadence from data-collection cadence — 1–2 hours |
-| 5 new scalar `@Observable` properties causing redundant SwiftUI diffs | MEDIUM | Refactor into a `SystemMetrics` struct; update ViewModel and View reads — 2–4 hours |
-
----
-
-## Pitfall-to-Phase Mapping
-
-v1.2 phases: **Research** (probe all APIs, validate formulas on device), **Implement** (wire confirmed metrics into ViewModel and dashboard UI), **Polish** (smoothing, UX, energy validation).
-
-| Pitfall | Prevention Phase | Verification |
-|---------|------------------|--------------|
-| Zero-struct `previousLoad` / inflated first sample | Research | First displayed CPU reading is "—", not a suspicious high value |
-| CPU formula numerator includes idle | Research | CPU label shows ~2–5% on an idle device, not 95%+ |
-| `KERN_SUCCESS` guard / wrong count formula | Research | `precondition(kr == KERN_SUCCESS)` passes on every call during development |
-| Non-sendable C struct / Swift 6 concurrency errors | Research | `Product > Build` zero concurrency warnings before any ViewModel integration |
-| `vm_statistics64` field misinterpretation | Research | Displayed available memory within 10% of Xcode Memory Report on physical device |
-| `vm_kernel_page_size` not used | Research | Memory in MB/GB, not in pages; cross-checked with Instruments |
-| `isBatteryMonitoringEnabled` lifecycle mismatch | Implement | stopPolling() sets it false; verified by Console log after backgrounding |
-| `UIDeviceBatteryLevelDidChange` for live display | Implement | Battery label updates every 10s alongside thermal state update |
-| Multiple `@Observable` scalars causing redundant diffs | Implement | All new metrics bundled in `SystemMetrics` struct before merging |
-| UI thrashing from raw CPU variance | Polish | CPU label does not jump more than 4 points between ticks under stable load |
-| EMA lag hiding genuine spikes | Polish | Simulated load spike (video encode) visible in CPU reading within 2 ticks (20s) |
-| Multi-metric chart performance at long sessions | Polish | Chart updates without perceptible lag after 30 minutes of continuous use on device |
+| Signed IPA blocking re-sign | LOW | Re-export with `CODE_SIGNING_REQUIRED=NO`; re-upload to GitHub Releases |
+| source.json field-name mismatch | LOW | Fix JSON; remove source from SideStore; re-add — may need SideStore restart if CoreData is corrupt |
+| bundleIdentifier mismatch | MEDIUM | Align all three sources (Xcode, Info.plist, source.json); may need to wait 7 days for old App ID to expire |
+| App slot limit hit | LOW | Wait for App IDs to expire (rolling 7-day window); or switch to dedicated Apple ID |
+| VPN silent refresh failure | LOW | Enable StosVPN; force manual refresh from SideStore My Apps |
+| GitHub API rate-limiting | LOW | Replace `api.github.com` URLs with direct CDN release asset URLs |
+| Wrong `size` field | LOW | Update source.json with correct byte count; increment version or create new release |
+| Version mismatch | LOW | Align `version`/`buildVersion` in source.json with Info.plist; re-publish |
+| Anisette lockout | MEDIUM | Switch Anisette server URL in SideStore Settings; may need to recover Apple ID via Apple support if soft-locked |
+| Certificate revoked by second device | MEDIUM | On all affected devices: SideStore → My Apps → long-press app → Refresh; do this before app expires |
 
 ---
 
 ## Sources
 
-- [Apple Developer Forums — Do we need to release the reference count on host port](https://developer.apple.com/forums/thread/725854) — confirms `mach_host_self()` is a special non-destructible port; `mach_port_deallocate` not required
-- [SystemKit/System.swift (beltex/SystemKit)](https://github.com/beltex/SystemKit/blob/master/SystemKit/System.swift) — reference implementation: tick delta pattern, struct allocation/deallocation, `processorLoadInfo` showing `mach_port_deallocate` on non-host ports
-- [CPU.swift gist (paalgyula)](https://gist.github.com/paalgyula/47c8e37f6785bed6634d1cc1fb5697bc) — CPU percentage formula: `(user + sys + nice) / (user + sys + nice + idle) * 100`
-- [Apple Developer Documentation — host_statistics64](https://developer.apple.com/documentation/kernel/1502863-host_statistics64) — official API docs
-- [Apple Developer Documentation — vm_statistics64_data_t](https://developer.apple.com/documentation/kernel/vm_statistics64_data_t) — memory struct fields including `speculative_count`
-- [Apple Developer Documentation — isBatteryMonitoringEnabled](https://developer.apple.com/documentation/uikit/uidevice/isbatterymonitoringenabled) — battery monitoring lifecycle; default is NO
-- [Apple Developer Documentation — Understanding and improving SwiftUI performance](https://developer.apple.com/documentation/Xcode/understanding-and-improving-swiftui-performance) — view redraw cost guidance
-- [Swift Forums — How to update SwiftUI many times a second while being performant](https://forums.swift.org/t/how-to-update-swiftui-many-times-a-second-while-being-performant/71249) — UI thrashing and debounce patterns
-- [Apple Energy Efficiency Guide for iOS Apps — Fundamental Concepts](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/EnergyGuide-iOS/FundamentalConcepts.html) — polling and energy cost principles; no specific interval thresholds published
-- [Swift.org — Common Swift 6 concurrency migration problems](https://www.swift.org/migration/documentation/swift-6-concurrency-migration-guide/commonproblems/) — non-sendable types, actor isolation, C interop patterns
-- [Hacking With Swift — Swift 6.0 complete concurrency](https://www.hackingwithswift.com/swift/6.0/concurrency) — Sendable enforcement and non-sendable closure captures
-- [Get virtual memory usage on iOS — gist (algal)](https://gist.github.com/algal/cd3b5dfc16c9d577846d96713f7fba40) — `vm_statistics64` usage pattern including `speculative_count`
-- [Apple Developer Documentation — host_cpu_load_info_t](https://developer.apple.com/documentation/kernel/host_cpu_load_info_t) — official struct reference
-- [Apple Developer Forums — how to get overall CPU utilization of iPhone](https://developer.apple.com/forums/thread/11393) — Apple engineer notes on `host_statistics` vs process-specific APIs
+- [AltStore: Make a Source](https://faq.altstore.io/developers/make-a-source) — authoritative source.json field specification
+- [SideStore: Error Codes](https://docs.sidestore.io/docs/troubleshooting/error-codes) — Error 1009, 3011, 3013, 1414, 1102, -1011 definitions
+- [SideStore: FAQ](https://docs.sidestore.io/docs/faq) — 3-app limit, 10-App-ID limit, Apple ID restrictions
+- [SideStore: Common Issues](https://docs.sidestore.io/docs/troubleshooting/common-issues) — VPN dependency, minimuxer, AFC errors
+- [SideStore Issue #735](https://github.com/SideStore/SideStore/issues/735) — downloadURL vs versions-only parsing incompatibility; CoreData corruption on malformed source
+- [SideStore Issue #978](https://github.com/SideStore/SideStore/issues/978) — Certificate revocation when installing on multiple devices
+- [SideStore Issue #1156](https://github.com/SideStore/SideStore/issues/1156) — Previous developer accounts soft-locked; "0 App IDs Remaining" false report
+- [SideStore Issue #782](https://github.com/SideStore/SideStore/issues/782) — Invalid entitlement error when app has more than 3 App Groups/Keychain groups
+- [SideStore: Custom Anisette Server](https://docs.sidestore.io/docs/advanced/anisette) — v3 vs v1 Anisette server differences; account lockout risk
+- [MrKai77/Export-unsigned-ipa-files](https://github.com/MrKai77/Export-unsigned-ipa-files) — Tutorial: `CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO` build flags
+- [SideStore/apps.json source.json](https://github.com/SideStore/apps.json/blob/main/_includes/source.json) — Official SideStore source reference implementation
+- [SideStore sidestore-source-types: Permission interface](https://sidestore.io/sidestore-source-types/interfaces/Permission.html) — Permission type enumeration (15 types)
+- [AltStore: App IDs](https://faq.altstore.io/altstore-classic/app-ids) — App ID limit mechanics and expiration
+- [How iOS Sideloading Actually Works in 2025 (DEV Community)](https://dev.to/1_king_0b1e1f8bfe6d1/how-ios-sideloading-actually-works-in-2025-dev-certs-altstore-and-the-eu-exception-1m2h) — certificate chain, 7-day expiry, free Apple ID mechanics
+- [SideStore Breaks on iOS 26.4 Beta After Apple Change (onejailbreak.com)](https://onejailbreak.com/blog/apple-targets-sidestore-signing-in-ios-26-4-beta/) — VPN loopback targeted in iOS 26.4 beta (not iOS 18; noted for awareness only)
+- [GitHub API Rate Limiting Discussion #146957](https://github.com/orgs/community/discussions/146957) — December 2024 raw download rate-limiting change
+- [AltStore Error Codes](https://faq.altstore.io/altstore-classic/error-codes) — cross-reference for AltStore vs SideStore error code semantics
 
 ---
-*Pitfalls research for: CoreWatch v1.2 — Mach kernel CPU/memory APIs, UIDevice battery, SwiftUI metrics display*
-*Researched: 2026-05-14*
+
+*Pitfalls research for: CoreWatch v1.5 — SideStore distribution, source.json, IPA signing, GitHub Releases hosting*
+*Researched: 2026-05-16*
