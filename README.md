@@ -24,7 +24,9 @@ When the device reaches **Serious** or **Critical** thermal state, a local notif
 
 ## Screenshots
 
-> _(Add device screenshots here)_
+| Thermal | CPU | Memory |
+|---------|-----|--------|
+| ![Thermal tab showing Nominal state](docs/screenshots/thermal.png) | ![CPU tab showing App CPU 2.0% and System CPU 60.4%](docs/screenshots/cpu.png) | ![Memory tab showing App Memory 33 MB and system breakdown](docs/screenshots/memory.png) |
 
 ---
 
